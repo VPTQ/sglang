@@ -1,9 +1,5 @@
-from vllm.distributed import (
-    GroupCoordinator,
-    get_tensor_model_parallel_rank,
-    get_tp_group,
-    tensor_model_parallel_all_reduce,
-)
+import torch
+from vllm.distributed import GroupCoordinator, get_tp_group
 
 _ATTN_TP_GROUP = None
 _ATTN_TP_RANK = None
