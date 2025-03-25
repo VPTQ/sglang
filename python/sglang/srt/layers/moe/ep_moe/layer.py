@@ -177,7 +177,9 @@ class EPMoE(torch.nn.Module):
         else:
             if quant_config.get_name() == "vptq":
                 self.quant_method: Optional[QuantizeMethodBase] = VPTQMoEMethod(
-                    quant_config
+                    quant_config,
+                    start_expert_id=self.start_expert_id,
+                    end_expert_id=self.end_expert_id,
                 )
                 self.use_fp8_w8a8 = quant_config.use_fp8_w8a8
                 self.use_block_quant = quant_config.use_block_quant
@@ -212,6 +214,15 @@ class EPMoE(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
 
+        if self.quant_method.quant_config.get_name() == 'vptq':
+            print(f'match VPTQMoEMethod')
+            output = self.quant_method.apply(
+                layer=self,
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+            )
+            return output
+        
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
                 hidden_states.device,
@@ -272,8 +283,7 @@ class EPMoE(torch.nn.Module):
             device=hidden_states.device,
             dtype=torch.int64,
         )
-        
-        # FIXIT
+
         # GroupGemm-0
         gateup_output = torch.empty(
             gateup_input.shape[0],

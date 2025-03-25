@@ -1,6 +1,7 @@
 # Supports VPTQ compression, see https://arxiv.org/abs/2409.17066
 
 import math
+from sqlite3 import paramstyle
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
@@ -98,9 +99,7 @@ class VPTQConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["VPTQLinearMethod"]:
         from sglang.srt.layers.moe.ep_moe.layer import EPMoE
-        print(f'get_quant_method: {prefix}, type: {type(layer)}')
         if isinstance(layer, LinearBase):
-            print(f'match linear base layer: {prefix}, type: {type(layer)}')
             linear_name = prefix.split(".")[-1]
             base_name = prefix[: prefix.rfind(".")]
             if linear_name == "qkv_proj":
@@ -118,8 +117,9 @@ class VPTQConfig(QuantizationConfig):
                 quant_config = self.get_config_for_key(base_name, linear_name)
             return VPTQLinearMethod(quant_config)
         elif isinstance(layer, EPMoE):
-            print(f'match ep moe layer: {prefix}')
-            return VPTQMoEMethod(self)
+            return VPTQMoEMethod(quant_config, 
+                                 start_expert_id=layer.start_expert_id, 
+                                 end_expert_id=layer.end_expert_id)
         return None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -526,8 +526,10 @@ class VPTQMoEMethod:
             return obj
         return super().__new__(cls)
 
-    def __init__(self, quant_config):
+    def __init__(self, quant_config, start_expert_id, end_expert_id):
         self.quant_config = quant_config
+        self.start_expert_id = start_expert_id
+        self.end_expert_id = end_expert_id
 
     def moe_weight_loader(self):
         def _moe_weight_loader(
@@ -537,9 +539,11 @@ class VPTQMoEMethod:
             shard_id: str,
             expert_id: int,
         ):
-            # print(f'param: {param.shape}, loaded_weight: {loaded_weight.shape}, '
-            #       f'weight_name: {weight_name}, shard_id: {shard_id}, expert_id: {expert_id}')
-            pass
+            local_expert_id = expert_id - self.start_expert_id
+            if local_expert_id < 0 or local_expert_id >= param.shape[0]:
+                pass
+            else:
+                param.data[local_expert_id] = loaded_weight
         return _moe_weight_loader
 
     def create_weights(
@@ -602,7 +606,7 @@ class VPTQMoEMethod:
             ),
             requires_grad=False,
         )
-         
+        
         extra_weight_attrs["weight_loader"] = self.moe_weight_loader()
         # indices
         layer.register_parameter("w13_indices", up_gate_proj_weight_indices)
@@ -627,37 +631,183 @@ class VPTQMoEMethod:
         layer.register_parameter("w2_weight_bias", down_proj_weight_bias)
         set_weight_attrs(up_gate_proj_weight_bias, extra_weight_attrs)
         set_weight_attrs(down_proj_weight_bias, extra_weight_attrs)
-         
+
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        hidden_states: torch.Tensor, 
         router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        custom_routing_function: Optional[Callable] = None,
-        correction_bias: Optional[torch.Tensor] = None,
-        activation: str = "silu",
-        inplace: bool = True,
-        no_combine: bool = False,
     ) -> torch.Tensor:
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
         from sglang.srt.layers.moe.topk import select_experts
-
-        # Expert selection
+        # topk
         topk_weights, topk_ids = select_experts(
-            hidden_states=x,
+            hidden_states=hidden_states,
             router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            custom_routing_function=custom_routing_function,
-            correction_bias=correction_bias,
+            top_k=layer.top_k,
+            renormalize=layer.renormalize,
+            use_grouped_topk=layer.use_grouped_topk,
+            topk_group=layer.topk_group,
+            num_expert_group=layer.num_expert_group,
+            correction_bias=layer.correction_bias,
+            custom_routing_function=layer.custom_routing_function,
         )
-        pass
 
+        # preprocess
+        from sglang.srt.layers.moe.ep_moe.kernels import run_moe_ep_preproess
+        reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
+            topk_ids, layer.num_experts
+        )
+
+        # gateup input
+        gateup_input = torch.empty(
+            (int(hidden_states.shape[0] * layer.top_k), hidden_states.shape[1]),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+
+        from sglang.srt.layers.moe.ep_moe.kernels import pre_reorder_triton_kernel
+        # PreReorder
+        pre_reorder_triton_kernel[(hidden_states.shape[0],)](
+            hidden_states,
+            gateup_input,
+            src2dst,
+            topk_ids,
+            None,
+            layer.start_expert_id,
+            layer.end_expert_id,
+            layer.top_k,
+            hidden_states.shape[1],
+            BLOCK_SIZE=512,
+        )
+
+        seg_indptr_cur_rank = seg_indptr[layer.start_expert_id : layer.end_expert_id + 2]
+        weight_indices_cur_rank = torch.arange(
+            0,
+            layer.num_experts_per_partition,
+            device=hidden_states.device,
+            dtype=torch.int64,
+        )
+
+        # GroupGemm-0
+        # dequantize the weight from rank
+        gateup_weight = vptq_ops.dequant(
+            layer.w13_indices,
+            layer.w13_centroids,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        
+        gateup_output = torch.empty(
+            gateup_input.shape[0],
+            gateup_weight.shape[1],
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        
+        gateup_output = layer.grouped_gemm_runner(
+            a=gateup_input,
+            b=gateup_weight,
+            c=gateup_output,
+            batch_size=layer.num_experts_per_partition,
+            weight_column_major=True,
+            seg_indptr=seg_indptr_cur_rank,
+            weight_indices=weight_indices_cur_rank,
+            use_fp8_w8a8=layer.use_fp8_w8a8,
+            scale_a=None,
+            scale_b=None,
+            block_shape=None,
+        )
+
+        # Act
+        down_input = torch.empty(
+            gateup_output.shape[0],
+            gateup_output.shape[1] // 2,
+            device=gateup_output.device,
+            dtype=hidden_states.dtype,
+        )
+        
+        layer.w2_input_scale = torch.ones(
+            layer.num_experts_per_partition,
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+        from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_triton_kernel
+        from sglang.srt.layers.moe.ep_moe.kernels import gelu_and_mul_triton_kernel
+        if layer.activation == "silu":
+            silu_and_mul_triton_kernel[(gateup_output.shape[0],)](
+                gateup_output,
+                down_input,
+                gateup_output.shape[1],
+                reorder_topk_ids,
+                None,
+                layer.start_expert_id,
+                layer.end_expert_id,
+                BLOCK_SIZE=512,
+            )
+        elif layer.activation == "gelu":
+            gelu_and_mul_triton_kernel[(gateup_output.shape[0],)](
+                gateup_output,
+                down_input,
+                gateup_output.shape[1],
+                reorder_topk_ids,
+                None,
+                layer.start_expert_id,
+                layer.end_expert_id,
+                BLOCK_SIZE=512,
+            )
+        else:
+            raise ValueError(f"Unsupported activation: {layer.activation=}")
+
+        # GroupGemm-1
+        # dequantize from rank
+        down_weight = vptq_ops.dequant(
+            layer.w2_indices,
+            layer.w2_centroids,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        
+        down_output = torch.empty(
+            down_input.shape[0],
+            down_weight.shape[1],
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        
+        down_output = self.grouped_gemm_runner(
+            a=down_input,
+            b=down_weight,
+            c=down_output,
+            batch_size=layer.num_experts_per_partition,
+            weight_column_major=True,
+            seg_indptr=seg_indptr_cur_rank,
+            weight_indices=weight_indices_cur_rank,
+            use_fp8_w8a8=layer.use_fp8_w8a8,
+            scale_a=None,
+            scale_b=None,
+            block_shape=layer.block_shape,
+        )
+
+        # PostReorder
+        from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_triton_kernel
+        output = torch.empty_like(hidden_states)
+        post_reorder_triton_kernel[(hidden_states.size(0),)](
+            down_output,
+            output,
+            src2dst,
+            topk_ids,
+            topk_weights,
+            layer.start_expert_id,
+            layer.end_expert_id,
+            layer.top_k,
+            hidden_states.size(1),
+            BLOCK_SIZE=512,
+        )
+        return output
+        
