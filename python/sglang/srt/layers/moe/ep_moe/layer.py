@@ -139,6 +139,7 @@ class EPMoE(torch.nn.Module):
         correction_bias: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         activation: str = "silu",
+        layer_id: int = 0,
     ):
         super().__init__()
 
@@ -177,15 +178,20 @@ class EPMoE(torch.nn.Module):
         else:
             if quant_config.get_name() == "vptq":
                 self.quant_method: Optional[QuantizeMethodBase] = VPTQMoEMethod(
-                    quant_config,
+                    quant_config=quant_config,
+                    layer_id=layer_id,
                     start_expert_id=self.start_expert_id,
                     end_expert_id=self.end_expert_id,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
                 )
                 self.use_fp8_w8a8 = quant_config.use_fp8_w8a8
                 self.use_block_quant = quant_config.use_block_quant
                 self.activation_scheme = quant_config.activation_scheme
                 self.w13_input_scale = None
                 self.w2_input_scale = None
+                self.weight_loader = self.quant_method.weight_loader
+            
             else:
                 self.quant_method: Optional[QuantizeMethodBase] = Fp8EPMoEMethod(
                     quant_config
@@ -215,7 +221,6 @@ class EPMoE(torch.nn.Module):
         assert self.quant_method is not None
 
         if self.quant_method.quant_config.get_name() == 'vptq':
-            print(f'match VPTQMoEMethod')
             output = self.quant_method.apply(
                 layer=self,
                 hidden_states=hidden_states,
