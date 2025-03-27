@@ -580,7 +580,6 @@ class VPTQMoEMethod:
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        print(f'create weights for layer {self.layer_id}, {params_dtype}, num_experts_per_partition: {num_experts_per_partition}')
         orig_weight_loader = extra_weight_attrs["weight_loader"]
         proj_prefix = ['up_proj', 'down_proj']
         proj_prefix_mapping = {
@@ -592,7 +591,7 @@ class VPTQMoEMethod:
             # up_proj and gate_proj merged in one operator
             fused_size = 2 if proj_prefix == 'up_proj' else 1
             
-            op_name = f'model.layers.3.mlp.experts.0.{proj_prefix}'
+            op_name = f'model.layers.{self.layer_id}.mlp.experts.{self.start_expert_id}.{proj_prefix}'
             layer_config = self.quant_config.config_for_layers[op_name]
             vector_len = layer_config['vector_lens'][1]
             num_centroids = layer_config['num_centroids'][1]
@@ -609,7 +608,7 @@ class VPTQMoEMethod:
             is_indice_packed = layer_config['is_indice_packed']
             num_outlier_centroids = layer_config['num_centroids'][0]
             assert is_indice_packed == True and num_outlier_centroids <= 0
-            
+            extra_weight_attrs["weight_loader"] = self.weight_loader()
             # create indices
             indices = torch.nn.Parameter(
                 torch.empty(
@@ -620,12 +619,12 @@ class VPTQMoEMethod:
             layer.register_parameter(f'{proj_prefix_mapping[proj_prefix]}_indices', indices)
             set_weight_attrs(indices, extra_weight_attrs)
             
-            # create centroids
+            # create centroids and res_centroids
             centroids = torch.nn.Embedding(
                 num_experts_per_partition * fused_size, (num_codebooks * num_centroids * vector_len), dtype=torch.bfloat16
             )
             centroids.weight.requires_grad = False
-            layer.register_parameter(f'{proj_prefix_mapping[proj_prefix]}_centroids', centroids.weight)
+            setattr(layer, f'{proj_prefix_mapping[proj_prefix]}_centroids', centroids)
             set_weight_attrs(centroids.weight, extra_weight_attrs)
             
             if num_res_centroids > 0:
@@ -633,7 +632,7 @@ class VPTQMoEMethod:
                     num_experts_per_partition * fused_size, (num_codebooks * num_res_centroids * vector_len), dtype=torch.bfloat16
                 )
                 res_centroids.weight.requires_grad = False
-                layer.register_parameter(f'{proj_prefix_mapping[proj_prefix]}_res_centroids', res_centroids.weight)
+                setattr(layer, f'{proj_prefix_mapping[proj_prefix]}_res_centroids', res_centroids)
                 set_weight_attrs(res_centroids.weight, extra_weight_attrs)
             
             # create weight scale
