@@ -3,6 +3,7 @@
 import math
 from typing import Any, Callable, Dict, List, Optional, Union
 
+from numpy import rec
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
@@ -579,20 +580,20 @@ class VPTQMoEMethod:
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        '''
-        def _create_weights(layer_id, expert_id, quant_config,
-                            indices_dict, centroids_dict, res_centroids_dict,
-                            weight_scale_dict, weight_bias_dict,
-                            layer_prefix='model.layers',
-                            expert_prefix='mlp.experts', 
-                            proj_prefix='gate_proj',
-                            **extra_weight_attrs):
-
-            # 'model.layers.0.mlp.experts.0.gate_proj'
-            op_name = f'{layer_prefix}.{layer_id}.{expert_prefix}.{expert_id}.{proj_prefix}'
-            layer_config = quant_config.config_for_layers[op_name]
-             
-            # vector_len = layer_config['vector_lens'][1]
+        print(f'create weights for layer {self.layer_id}, {params_dtype}, num_experts_per_partition: {num_experts_per_partition}')
+        orig_weight_loader = extra_weight_attrs["weight_loader"]
+        proj_prefix = ['up_proj', 'down_proj']
+        proj_prefix_mapping = {
+            'up_proj': 'w13',
+            'down_proj': 'w2'
+        }
+        
+        for proj_prefix in proj_prefix:
+            # up_proj and gate_proj merged in one operator
+            fused_size = 2 if proj_prefix == 'up_proj' else 1
+            
+            op_name = f'model.layers.3.mlp.experts.0.{proj_prefix}'
+            layer_config = self.quant_config.config_for_layers[op_name]
             vector_len = layer_config['vector_lens'][1]
             num_centroids = layer_config['num_centroids'][1]
             num_res_centroids = layer_config['num_res_centroids'][1]
@@ -602,240 +603,60 @@ class VPTQMoEMethod:
             out_features = layer_config['out_features']
             padding = (-out_features) % vector_len
             num_indices = (out_features + padding) // vector_len
+            index_bits = math.ceil(math.log2(num_centroids))
+            res_index_bits = math.ceil(math.log2(num_res_centroids)) if num_res_centroids > 0 else 0
+            packed_group_size = (group_size * (index_bits + res_index_bits) + 31) // 32 
             is_indice_packed = layer_config['is_indice_packed']
-            
-            # only support packed indices
-            assert is_indice_packed == True
+            num_outlier_centroids = layer_config['num_centroids'][0]
+            assert is_indice_packed == True and num_outlier_centroids <= 0
             
             # create indices
-            indices_dict[expert_id] = torch.nn.Parameter(
+            indices = torch.nn.Parameter(
                 torch.empty(
-                    num_codebooks, 1, 1, dtype=torch.int32
-                    # num_codebooks, num_indices, group_size, dtype=torch.int32
+                    num_experts_per_partition * fused_size, num_codebooks, num_indices, packed_group_size, dtype=torch.int32
                 ),
                 requires_grad=False,
             )
-            layer.register_parameter(f'{proj_prefix}_{expert_id}_indices', indices_dict[expert_id])
-            set_weight_attrs(indices_dict[expert_id], extra_weight_attrs)
+            layer.register_parameter(f'{proj_prefix_mapping[proj_prefix]}_indices', indices)
+            set_weight_attrs(indices, extra_weight_attrs)
             
             # create centroids
-            centroids_dict[expert_id] = torch.nn.Embedding(
-                num_codebooks, 1, dtype=torch.bfloat16
-                # num_codebooks, (num_centroids * vector_len), dtype=params_dtype
+            centroids = torch.nn.Embedding(
+                num_experts_per_partition * fused_size, (num_codebooks * num_centroids * vector_len), dtype=torch.bfloat16
             )
-            centroids_dict[expert_id].weight.requires_grad = False
-            layer.register_parameter(f'{proj_prefix}_{expert_id}_centroids', centroids_dict[expert_id].weight)
-            set_weight_attrs(centroids_dict[expert_id].weight, extra_weight_attrs)
+            centroids.weight.requires_grad = False
+            layer.register_parameter(f'{proj_prefix_mapping[proj_prefix]}_centroids', centroids.weight)
+            set_weight_attrs(centroids.weight, extra_weight_attrs)
             
-            # create res_centroids
             if num_res_centroids > 0:
-                res_centroids_dict[expert_id] = torch.nn.Embedding(
-                    1, 1, dtype=torch.bfloat16
-                    # num_codebooks, (num_res_centroids * vector_len), dtype=params_dtype
+                res_centroids = torch.nn.Embedding(
+                    num_experts_per_partition * fused_size, (num_codebooks * num_res_centroids * vector_len), dtype=torch.bfloat16
                 )
-                res_centroids_dict[expert_id].weight.requires_grad = False
-                layer.register_parameter(f'{proj_prefix}_{expert_id}_res_centroids', res_centroids_dict[expert_id].weight)
-                set_weight_attrs(res_centroids_dict[expert_id].weight, extra_weight_attrs)
+                res_centroids.weight.requires_grad = False
+                layer.register_parameter(f'{proj_prefix_mapping[proj_prefix]}_res_centroids', res_centroids.weight)
+                set_weight_attrs(res_centroids.weight, extra_weight_attrs)
             
             # create weight scale
-            weight_scale_dict[expert_id] = torch.nn.Parameter(
+            weight_scale = torch.nn.Parameter(
                 torch.empty(
-                    in_features, dtype=params_dtype
+                    num_experts_per_partition * fused_size, in_features, dtype=params_dtype
                 ),
                 requires_grad=False,
             )
-            layer.register_parameter(f'{proj_prefix}_{expert_id}_weight_scale', weight_scale_dict[expert_id])
-            set_weight_attrs(weight_scale_dict[expert_id], extra_weight_attrs)
+            layer.register_parameter(f'{proj_prefix_mapping[proj_prefix]}_weight_scale', weight_scale)
+            set_weight_attrs(weight_scale, extra_weight_attrs)
             
-            weight_bias_dict[expert_id] = torch.nn.Parameter(
+            # create weight bias
+            weight_bias = torch.nn.Parameter(
                 torch.empty(
-                   in_features, dtype=params_dtype
+                    num_experts_per_partition * fused_size, in_features, dtype=params_dtype
                 ),
                 requires_grad=False,
             )
-            layer.register_parameter(f'{proj_prefix}_{expert_id}_weight_bias', weight_bias_dict[expert_id])
-            set_weight_attrs(weight_bias_dict[expert_id], extra_weight_attrs)
-        '''
-        # indices_dict = {}
-        # centroids_dict = {}
-        # res_centroids_dict = {}
-        # weight_scale_dict = {}
-        # weight_bias_dict = {}
-        # op_name = f'{line_prefix}.{layer_id}.{expert_prefix}.{expert_id}.{proj_prefix}'
-        # layer_config = quant_config.config_for_layers[op_name]
-        # vector_len = layer_config['vector_lens'][1]
-        # vector_len = layer_config['vector_lens'][1]
-        # num_centroids = layer_config['num_centroids'][1]
-        # num_res_centroids = layer_config['num_res_centroids'][1]
-        # num_codebooks = group_num = layer_config['group_num']
-        # group_size = layer_config['group_size']
-        # in_features = layer_config['in_features']
-        # out_features = layer_config['out_features']
-        # padding = (-out_features) % vector_len
-        # num_indices = (out_features + padding) // vector_len
-        # is_indice_packed = layer_config['is_indice_packed']
-        # 'model.layers.0.mlp.experts.0.gate_proj'
-        # layer_prefix='model.layers',
-        # expert_prefix='mlp.experts', 
-        # proj_prefix='gate_proj',
-        
-        orig_weight_loader = extra_weight_attrs["weight_loader"]
-        extra_weight_attrs["weight_loader"] = self.weight_loader()
-        # create indices
-        w13_indices = torch.nn.Parameter(
-            torch.empty(
-                1, 1, 1, dtype=torch.int32
-                # num_codebooks, num_indices, group_size, dtype=torch.int32
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter(f'w13_indices', w13_indices)
-        set_weight_attrs(w13_indices, extra_weight_attrs)
-        
-        w2_indices = torch.nn.Parameter(
-            torch.empty(
-                1, 1, 1, dtype=torch.int32
-                # num_codebooks, num_indices, group_size, dtype=torch.int32
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter(f'w2_indices', w2_indices)
-        set_weight_attrs(w2_indices, extra_weight_attrs) 
-        
-        w13_centroids = torch.nn.Embedding(
-            1, 1, dtype=torch.bfloat16
-        )
-        w13_centroids.weight.requires_grad = False
-        layer.w13_centroids = w13_centroids
-        set_weight_attrs(w13_centroids.weight, extra_weight_attrs) 
-        
-        w2_centroids = torch.nn.Embedding(
-            1, 1, dtype=torch.bfloat16
-        )
-        w2_centroids.weight.requires_grad = False
-        layer.w2_centroids = w2_centroids
-        set_weight_attrs(w2_centroids.weight, extra_weight_attrs) 
-         
-        w13_weight_scale = torch.nn.Parameter(
-            torch.empty(
-                1, 1, dtype=torch.float32
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter(f'w13_weight_scale', w13_weight_scale)
-        set_weight_attrs(w13_weight_scale, extra_weight_attrs) 
-        
-        w2_weight_scale = torch.nn.Parameter(
-            torch.empty(
-                1, 1, dtype=torch.float32
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter(f'w2_weight_scale', w2_weight_scale)
-        set_weight_attrs(w2_weight_scale, extra_weight_attrs) 
-        
-        w13_weight_bias = torch.nn.Parameter(
-            torch.empty(
-                1, 1, dtype=torch.float32
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter(f'w13_weight_bias', w13_weight_bias)
-        set_weight_attrs(w13_weight_bias, extra_weight_attrs) 
-        
-        w2_weight_bias = torch.nn.Parameter(
-            torch.empty(
-                1, 1, dtype=torch.float32
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter(f'w2_weight_bias', w2_weight_bias)
-        set_weight_attrs(w2_weight_bias, extra_weight_attrs)
+            layer.register_parameter(f'{proj_prefix_mapping[proj_prefix]}_weight_bias', weight_bias)
+            set_weight_attrs(weight_bias, extra_weight_attrs)
         
         extra_weight_attrs["weight_loader"] = orig_weight_loader
-        # op_name = f'model.layers.{self.layer_id}.mlp.experts.gate_proj'
-        # layer_config = quant_config.config_for_layers[op_name]
-        # # only support packed indices
-        # assert is_indice_packed == True 
-        
-        # # vector_len = layer_config['vector_lens'][1]
-        # vector_len = layer_config['vector_lens'][1]
-        # num_centroids = layer_config['num_centroids'][1]
-        # num_res_centroids = layer_config['num_res_centroids'][1]
-        # num_codebooks = group_num = layer_config['group_num']
-        # group_size = layer_config['group_size']
-        # in_features = layer_config['in_features']
-        # out_features = layer_config['out_features']
-        # padding = (-out_features) % vector_len
-        # num_indices = (out_features + padding) // vector_len
-        # is_indice_packed = layer_config['is_indice_packed']
-        
-        # # only support packed indices
-        # assert is_indice_packed == True
-        
-        # # create indices
-        # indices_dict[expert_id] = torch.nn.Parameter(
-        #     torch.empty(
-        #         num_codebooks, 1, 1, dtype=torch.int32
-        #         # num_codebooks, num_indices, group_size, dtype=torch.int32
-        #     ),
-        #     requires_grad=False,
-        # )
-        # layer.register_parameter(f'{proj_prefix}_{expert_id}_indices', indices_dict[expert_id])
-        # set_weight_attrs(indices_dict[expert_id], extra_weight_attrs)
-        
-        # # create centroids
-        # centroids_dict[expert_id] = torch.nn.Embedding(
-        #     num_codebooks, 1, dtype=torch.bfloat16
-        #     # num_codebooks, (num_centroids * vector_len), dtype=params_dtype
-        # )
-        # centroids_dict[expert_id].weight.requires_grad = False
-        # layer.register_parameter(f'{proj_prefix}_{expert_id}_centroids', centroids_dict[expert_id].weight)
-        # set_weight_attrs(centroids_dict[expert_id].weight, extra_weight_attrs)
-        
-        # # create res_centroids
-        # if num_res_centroids > 0:
-        #     res_centroids_dict[expert_id] = torch.nn.Embedding(
-        #         1, 1, dtype=torch.bfloat16
-        #         # num_codebooks, (num_res_centroids * vector_len), dtype=params_dtype
-        #     )
-        #     res_centroids_dict[expert_id].weight.requires_grad = False
-        #     layer.register_parameter(f'{proj_prefix}_{expert_id}_res_centroids', res_centroids_dict[expert_id].weight)
-        #     set_weight_attrs(res_centroids_dict[expert_id].weight, extra_weight_attrs)
-        
-        # # create weight scale
-        # weight_scale_dict[expert_id] = torch.nn.Parameter(
-        #     torch.empty(
-        #         in_features, dtype=params_dtype
-        #     ),
-        #     requires_grad=False,
-        # )
-        # layer.register_parameter(f'{proj_prefix}_{expert_id}_weight_scale', weight_scale_dict[expert_id])
-        # set_weight_attrs(weight_scale_dict[expert_id], extra_weight_attrs)
-        
-        # weight_bias_dict[expert_id] = torch.nn.Parameter(
-        #     torch.empty(
-        #        in_features, dtype=params_dtype
-        #     ),
-        #     requires_grad=False,
-        # )
-        # layer.register_parameter(f'{proj_prefix}_{expert_id}_weight_bias', weight_bias_dict[expert_id])
-        # set_weight_attrs(weight_bias_dict[expert_id], extra_weight_attrs)
-        #      
-        # proj_list = ['gate_proj', 'up_proj', 'down_proj']
-        # extra_weight_attrs["weight_loader"] = self.weight_loader
-        # for expert_id in range(num_experts_per_partition):
-        #     _expert_id = expert_id + self.start_expert_id
-        #     if _expert_id < self.start_expert_id or _expert_id >= self.end_expert_id:
-        #         continue
-        #     for proj_name in proj_list:
-        #         print(f'layer {self.layer_id}, create {proj_name} for expert {_expert_id}, {self.start_expert_id}, {self.end_expert_id} ')
-        #         _create_weights(self.layer_id, _expert_id, self.quant_config,
-        #                         indices_dict, centroids_dict, res_centroids_dict,
-        #                         weight_scale_dict, weight_bias_dict,
-        #                         layer_prefix='model.layers',
-        #                         expert_prefix='mlp.experts', 
-        #                         proj_prefix=proj_name)
 
     def apply(
         self,
