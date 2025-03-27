@@ -1,5 +1,6 @@
 # Supports VPTQ compression, see https://arxiv.org/abs/2409.17066
 
+from inspect import indentsize
 import math
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -547,13 +548,14 @@ class VPTQMoEMethod:
 
     def __init__(self, quant_config, layer_id,
                  start_expert_id, end_expert_id, 
-                 hidden_size, intermediate_size, ):
+                 hidden_size, intermediate_size, GroupedGemmRunner):
         self.quant_config = quant_config
         self.start_expert_id = start_expert_id
         self.end_expert_id = end_expert_id
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.layer_id = layer_id
+        self.GroupedGemmRunner = GroupedGemmRunner
 
     def weight_loader(self):
         def _weight_loader(
@@ -563,12 +565,11 @@ class VPTQMoEMethod:
             shard_id: str,
             expert_id: int,
         ):
-            print(f'load {weight_name} for expert {expert_id}, {self.start_expert_id}, {self.end_expert_id}')
-            # local_expert_id = expert_id - self.start_expert_id
-            # if local_expert_id < 0 or local_expert_id >= param.shape[0]:
-            #     pass
-            # else:
-            #     param.data[local_expert_id] = loaded_weight
+            local_expert_id = expert_id - self.start_expert_id
+            if local_expert_id < 0 or local_expert_id >= param.shape[0]:
+                pass
+            else:
+                param.data[local_expert_id] = loaded_weight
         return _weight_loader
 
     def create_weights(
@@ -676,13 +677,13 @@ class VPTQMoEMethod:
             correction_bias=layer.correction_bias,
             custom_routing_function=layer.custom_routing_function,
         )
-
+ 
         # preprocess
         from sglang.srt.layers.moe.ep_moe.kernels import run_moe_ep_preproess
         reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
             topk_ids, layer.num_experts
         )
-
+        
         # gateup input
         gateup_input = torch.empty(
             (int(hidden_states.shape[0] * layer.top_k), hidden_states.shape[1]),
@@ -704,7 +705,7 @@ class VPTQMoEMethod:
             hidden_states.shape[1],
             BLOCK_SIZE=512,
         )
-
+        
         seg_indptr_cur_rank = seg_indptr[layer.start_expert_id : layer.end_expert_id + 2]
         weight_indices_cur_rank = torch.arange(
             0,
@@ -715,40 +716,45 @@ class VPTQMoEMethod:
 
         # GroupGemm-0
         # dequantize the weight from rank
-        print(f'gateup_input shape: {gateup_input.shape}')
-        print(f'reorder_topk_ids: {reorder_topk_ids}')
-        print(f'gateup_weight_dim,')
+        # print(f'gateup_input shape: {gateup_input.shape}')
+        # print(f'reorder_topk_ids: {reorder_topk_ids}')
+        # print(f'gateup_weight_dim,')
         
-        gateup_weight = torch.empty(
-            self.num_experts_per_partition,
+        gateup_weight = torch.ones(
+            layer.num_experts_per_partition,
+            2 * self.intermediate_size,
             self.hidden_size,
-            self.intermediate_size,
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
 
-        # gateup_weight_dim = 1024
-        gateup_weight = dequant_experts(
-            gateup_weight,
-            reorder_topk_ids,
-            layer.w13_centroids,
-            None,
-            layer.w13_weight_scale,
-            layer.w13_weight_bias,
-            None,
-            layer.start_expert_id,
-            layer.end_expert_id,
-            None)
+        # # gateup_weight_dim = 1024
+        # gateup_weight = dequant_experts(
+        #     gateup_weight,
+        #     reorder_topk_ids,
+        #     layer.w13_centroids,
+        #     None,
+        #     layer.w13_weight_scale,
+        #     layer.w13_weight_bias,
+        #     None,
+        #     layer.start_expert_id,
+        #     layer.end_expert_id,
+        #     None)
          
         # only fill selected experts
         gateup_output = torch.empty(
             gateup_input.shape[0],
-            gateup_weight.shape[1],
+            2 * self.intermediate_size,
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
         
-        gateup_output = layer.grouped_gemm_runner(
+        self.grouped_gemm_runner = self.GroupedGemmRunner(
+            device=hidden_states.device,
+            use_flashinfer=False,  # TODO: use flashinfer
+        )
+        
+        gateup_output = self.grouped_gemm_runner(
             a=gateup_input,
             b=gateup_weight,
             c=gateup_output,
@@ -761,7 +767,7 @@ class VPTQMoEMethod:
             scale_b=None,
             block_shape=None,
         )
-
+        
         # Act
         down_input = torch.empty(
             gateup_output.shape[0],
@@ -775,6 +781,7 @@ class VPTQMoEMethod:
             dtype=torch.float32,
             device=hidden_states.device,
         )
+        
         from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_triton_kernel
         from sglang.srt.layers.moe.ep_moe.kernels import gelu_and_mul_triton_kernel
         if layer.activation == "silu":
@@ -804,16 +811,29 @@ class VPTQMoEMethod:
 
         # GroupGemm-1
         # dequantize from rank
-        down_weight = vptq_ops.dequant(
-            layer.w2_indices,
-            layer.w2_centroids,
-            None,
-            None,
-            None,
-            None,
-            None,
+        # down_weight = vptq_ops.dequant(
+        #     layer.w2_indices,
+        #     layer.w2_centroids,
+        #     None,
+        #     None,
+        #     None,
+        #     None,
+        #     None,
+        # )
+        # torch.empty(
+        #  num_experts_per_partition,
+        #  hidden_size,
+        #  intermediate_size,
+        #  dtype=params_dtype,
+        # ),
+        down_weight = torch.ones(
+            layer.num_experts_per_partition,
+            self.hidden_size,
+            self.intermediate_size,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
         )
-        
+         
         down_output = torch.empty(
             down_input.shape[0],
             down_weight.shape[1],
@@ -832,7 +852,7 @@ class VPTQMoEMethod:
             use_fp8_w8a8=layer.use_fp8_w8a8,
             scale_a=None,
             scale_b=None,
-            block_shape=layer.block_shape,
+            block_shape=None,
         )
 
         # PostReorder
@@ -850,5 +870,6 @@ class VPTQMoEMethod:
             hidden_states.size(1),
             BLOCK_SIZE=512,
         )
+
         return output
         

@@ -184,6 +184,7 @@ class EPMoE(torch.nn.Module):
                     end_expert_id=self.end_expert_id,
                     hidden_size=hidden_size,
                     intermediate_size=intermediate_size,
+                    GroupedGemmRunner=GroupedGemmRunner,
                 )
                 self.use_fp8_w8a8 = quant_config.use_fp8_w8a8
                 self.use_block_quant = quant_config.use_block_quant
